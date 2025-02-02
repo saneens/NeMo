@@ -32,10 +32,10 @@ model:
   codec_model_downsample_factor: 1024
   load_cached_codes_if_available: true
   prior_scaling_factor: null
-  prior_end_step: 0
-  prior_scaledown_start_step: 0
-  alignment_loss_scale: 0.0
-  embedding_dim: 768
+  prior_end_step: 12000
+  prior_scaledown_start_step: 8000
+  alignment_loss_scale: 0.002
+  embedding_dim: 1536
   codecmodel_path: null
   max_epochs: ${max_epochs}
   steps_per_epoch: ${weighted_sampling_steps_per_epoch}
@@ -126,7 +126,7 @@ model:
     use_flash_self_attention: false
     use_flash_x_attention: false
     deterministic: false
-    d_model: 768
+    d_model: 1536
     n_layers: 6
     p_dropout: 0.1
     n_heads: 12
@@ -166,19 +166,19 @@ model:
     use_flash_self_attention: false
     use_flash_x_attention: false
     deterministic: false
-    d_model: 768
+    d_model: 1536
     n_layers: 12
     p_dropout: 0.1
     n_heads: 12
     has_xattn: true
     apply_norm_to_cond: true
-    kernel_size: 3
+    kernel_size: 1
     layer_scale_init: 0.1
     layer_scale_decay: 0.95
     max_length_causal_mask: 2048 # Determinse max size of positional embeddings
     context_xattn:
         n_heads: 12
-        d_heads: 768
+        d_heads: 1536
         pos_emb:
           name: ""
 
