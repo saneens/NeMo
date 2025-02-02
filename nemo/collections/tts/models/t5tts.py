@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import itertools
 from typing import List
 from math import ceil
 import numpy as np
@@ -46,6 +47,9 @@ from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.tts.parts.utils.tts_dataset_utils import stack_tensors
 from nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers import AggregatedTTSTokenizer
 from nemo.collections.tts.data.text_to_speech_dataset_lhotse import build_lhotse_dataloader, T5TTSLhotseDataset
+
+from lhotse import Recording, AudioSource
+from lhotse.shar import AudioTarWriter
 
 HAVE_WANDB = True
 try:
@@ -482,6 +486,7 @@ class T5TTS_Model(ModelPT):
         addtional_decoder_mask = None
         context_audio_codes = None
         context_audio_codes_lens = None
+        target_wav_names = None
 
         if self.model_type == 'decoder_pretrain_synthesizer':
             text = None
@@ -554,6 +559,9 @@ class T5TTS_Model(ModelPT):
                 multi_encoder_mapping = None
                 additional_decoder_input = context_embeddings
                 addtional_decoder_mask = context_mask
+
+            if "target_wav_names" in batch:
+                target_wav_names = batch['target_wav_names']
         
         else:
             raise ValueError(f"Unsupported model type {self.model_type}")
@@ -570,6 +578,7 @@ class T5TTS_Model(ModelPT):
             'text_lens': text_lens,
             'context_audio_codes': context_audio_codes,
             'context_audio_codes_lens': context_audio_codes_lens,
+            'target_wav_names': target_wav_names,
         }
 
     def prepare_dummy_cond_for_cfg(self, cond, cond_mask, additional_decoder_input, additional_dec_mask):
@@ -690,7 +699,8 @@ class T5TTS_Model(ModelPT):
             'text_lens': context_tensors['text_lens'],
             'context_audio_codes': context_tensors['context_audio_codes'],
             'context_audio_codes_lens': context_tensors['context_audio_codes_lens'],
-            'dec_context_size' : dec_context_size
+            'dec_context_size' : dec_context_size,
+            'target_wav_names': context_tensors['target_wav_names'],
         }
     
     def training_step(self, batch, batch_idx):
@@ -983,13 +993,20 @@ class T5TTS_ModelInference(T5TTS_Model):
     """Small override to save inference metrics"""
     def __init__(self, cfg: DictConfig, trainer: 'Trainer' = None):
         super().__init__(cfg, trainer)
-        self.eval_asr_model = nemo_asr.models.EncDecRNNTBPEModel.from_pretrained(model_name="nvidia/parakeet-tdt-1.1b")
-        self.eval_asr_model.freeze()
-        self.eval_asr_model.eval()
+        self.predict_step_outputs = []
+        self.shar_output_path = cfg.get('shar_output_path', None)
+        self.save_in_lhotse_shars = cfg.get('save_in_lhotse_shars', False)
+        print(f"save_in_lhotse_shars: {self.save_in_lhotse_shars}")
+        print(f"shar_output_path: {self.shar_output_path}")
+        if not self.save_in_lhotse_shars:
+            self.eval_asr_model = nemo_asr.models.EncDecRNNTBPEModel.from_pretrained(model_name="nvidia/parakeet-tdt-1.1b")
+            self.eval_asr_model.freeze()
+            self.eval_asr_model.eval()
 
-        self.eval_speaker_verification_model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(model_name='titanet_large')
-        self.eval_speaker_verification_model.freeze()
-        self.eval_speaker_verification_model.eval()
+            self.eval_speaker_verification_model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(model_name='titanet_large')
+            self.eval_speaker_verification_model.freeze()
+            self.eval_speaker_verification_model.eval()
+        
     
     def process_text(self, input_text):
         """
@@ -1043,59 +1060,126 @@ class T5TTS_ModelInference(T5TTS_Model):
     def test_step(self, batch, batch_idx):
         with torch.no_grad():
             test_dl_batch_size = self._test_dl.batch_size
-            predicted_audio, predicted_audio_lens, predicted_codes, predicted_codes_lens = self.infer_batch(batch, max_decoder_steps=self.cfg.get('max_decoder_steps', 500))
+            predicted_audio, predicted_audio_lens, predicted_codes, predicted_codes_lens = self.infer_batch(
+                batch, 
+                max_decoder_steps=self.cfg.get('max_decoder_steps', 500),
+                temperature=self.cfg.get('temperature', 0.7),
+                use_cfg=self.cfg.get('use_cfg', False),
+                cfg_scale=self.cfg.get('cfg_scale', 1.0)
+            )
             predicted_audio_paths = []
             audio_durations = []
-            for idx in range(predicted_audio.size(0)):
-                predicted_audio_np = predicted_audio[idx].float().detach().cpu().numpy()
-                predicted_audio_np = predicted_audio_np[:predicted_audio_lens[idx]]
-                item_idx = batch_idx * test_dl_batch_size + idx
-                # Save the predicted audio
-                log_dir = self.logger.log_dir
-                audio_dir = os.path.join(log_dir, 'audios')
-                if not os.path.exists(audio_dir):
-                    os.makedirs(audio_dir)
-                audio_path = os.path.join(audio_dir, f'predicted_audioRank{self.global_rank}_{item_idx}.wav')
-                audio_durations.append(len(predicted_audio_np) / self.cfg.sample_rate)
-                sf.write(audio_path, predicted_audio_np, self.cfg.sample_rate)
-
-                predicted_codes_torch = predicted_codes[idx].cpu().type(torch.int16)
-                predicted_codes_torch = predicted_codes_torch[:, :predicted_codes_lens[idx]]
-                torch.save(predicted_codes_torch, os.path.join(audio_dir, f'predicted_audioRank{self.global_rank}_{item_idx}_codes.pt'))
-                predicted_audio_paths.append(audio_path)
-            
-            with torch.no_grad():
-                pred_transcripts = self.eval_asr_model.transcribe(predicted_audio_paths, batch_size=len(predicted_audio_paths))[0]
-                pred_speaker_embeddings = self.get_speaker_embeddings_from_filepaths(predicted_audio_paths)
-                gt_speaker_embeddings = self.get_speaker_embeddings_from_filepaths(batch['audio_filepaths'])
-
-            for idx in range(predicted_audio.size(0)):
-                audio_path = predicted_audio_paths[idx]
-                item_idx = batch_idx * test_dl_batch_size + idx
-                pred_transcript = pred_transcripts[idx]
-                gt_transcript = self.process_text(batch['raw_texts'][idx])
-
-                cer_gt = word_error_rate([pred_transcript], [gt_transcript], use_cer=True)
-                wer_gt = word_error_rate([pred_transcript], [gt_transcript], use_cer=False)
-
-                spk_embedding_pred = pred_speaker_embeddings[idx].cpu().numpy()
-                spk_embedding_gt = gt_speaker_embeddings[idx].cpu().numpy()
-                
-                spk_similarity = np.dot(spk_embedding_pred, spk_embedding_gt) / (
-                    np.linalg.norm(spk_embedding_pred) * np.linalg.norm(spk_embedding_gt)
-                )
-                
-                item_metrics = {
-                    'cer_gt': float(cer_gt),
-                    'wer_gt': float(wer_gt),
-                    'duration' : audio_durations[idx],
-                    'spk_similarity': float(spk_similarity),
-                    'pred_transcript': pred_transcript,
-                    'gt_transcript': gt_transcript,
+            if self.save_in_lhotse_shars:
+                print(f"... keys in batch: {list(batch.keys())}")
+                if 'target_wav_names' in batch:
+                    target_wav_names = batch['target_wav_names']
+                predicted_audio_list = []
+                target_wav_list = []
+                for idx in range(predicted_audio.size(0)):
+                    predicted_audio_np = predicted_audio[idx].float().detach().cpu().numpy()
+                    predicted_audio_np = predicted_audio_np[:predicted_audio_lens[idx]]
+                    target_wav_name = target_wav_names[idx]
+                    predicted_audio_list.append(predicted_audio_np)
+                    target_wav_list.append(target_wav_name)
+                results = {
+                    'predicted_audio': predicted_audio_list,
+                    'target_wav_names': target_wav_list
                 }
+                self.predict_step_outputs.append(results)
+            else:
+                for idx in range(predicted_audio.size(0)):
+                    predicted_audio_np = predicted_audio[idx].float().detach().cpu().numpy()
+                    predicted_audio_np = predicted_audio_np[:predicted_audio_lens[idx]]
+                    item_idx = batch_idx * test_dl_batch_size + idx
+                    # Save the predicted audio
+                    log_dir = self.logger.log_dir
+                    audio_dir = os.path.join(log_dir, 'audios')
+                    if not os.path.exists(audio_dir):
+                        os.makedirs(audio_dir)
+                    audio_path = os.path.join(audio_dir, f'predicted_audioRank{self.global_rank}_{item_idx}.wav')
+                    audio_durations.append(len(predicted_audio_np) / self.cfg.sample_rate)
+                    sf.write(audio_path, predicted_audio_np, self.cfg.sample_rate)
 
-                with open(os.path.join(audio_dir, f'predicted_audioRank{self.global_rank}_{item_idx}_metrics.json'), 'w') as f:
-                    json.dump(item_metrics, f)
+                    predicted_codes_torch = predicted_codes[idx].cpu().type(torch.int16)
+                    predicted_codes_torch = predicted_codes_torch[:, :predicted_codes_lens[idx]]
+                    torch.save(predicted_codes_torch, os.path.join(audio_dir, f'predicted_audioRank{self.global_rank}_{item_idx}_codes.pt'))
+                    predicted_audio_paths.append(audio_path)
+                
+                with torch.no_grad():
+                    pred_transcripts = self.eval_asr_model.transcribe(predicted_audio_paths, batch_size=len(predicted_audio_paths))[0]
+                    pred_speaker_embeddings = self.get_speaker_embeddings_from_filepaths(predicted_audio_paths)
+                    gt_speaker_embeddings = self.get_speaker_embeddings_from_filepaths(batch['audio_filepaths'])
+
+                for idx in range(predicted_audio.size(0)):
+                    audio_path = predicted_audio_paths[idx]
+                    item_idx = batch_idx * test_dl_batch_size + idx
+                    pred_transcript = pred_transcripts[idx]
+                    gt_transcript = self.process_text(batch['raw_texts'][idx])
+
+                    cer_gt = word_error_rate([pred_transcript], [gt_transcript], use_cer=True)
+                    wer_gt = word_error_rate([pred_transcript], [gt_transcript], use_cer=False)
+
+                    spk_embedding_pred = pred_speaker_embeddings[idx].cpu().numpy()
+                    spk_embedding_gt = gt_speaker_embeddings[idx].cpu().numpy()
+                    
+                    spk_similarity = np.dot(spk_embedding_pred, spk_embedding_gt) / (
+                        np.linalg.norm(spk_embedding_pred) * np.linalg.norm(spk_embedding_gt)
+                    )
+                    
+                    item_metrics = {
+                        'cer_gt': float(cer_gt),
+                        'wer_gt': float(wer_gt),
+                        'duration' : audio_durations[idx],
+                        'spk_similarity': float(spk_similarity),
+                        'pred_transcript': pred_transcript,
+                        'gt_transcript': gt_transcript,
+                    }
+
+                    with open(os.path.join(audio_dir, f'predicted_audioRank{self.global_rank}_{item_idx}_metrics.json'), 'w') as f:
+                        json.dump(item_metrics, f)
+
+    def on_test_epoch_end(self):
+        outputs = self.predict_step_outputs
+        world_size = 1
+        local_rank = 0
+        if torch.distributed.is_initialized():
+            print(f"torch distributed is initialized")
+            world_size = torch.distributed.get_world_size()
+            local_rank = torch.distributed.get_rank()
+        print(f"world_size: {world_size}, local_rank: {local_rank}")
+        if self.save_in_lhotse_shars:
+            gather_results = [None for _ in range(world_size)]
+            all_audio_outs = list(itertools.chain(*[item['predicted_audio'] for item in outputs]))
+            all_wav_name_outs = list(itertools.chain(*[item['target_wav_names'] for item in outputs]))
+
+            torch.distributed.all_gather_object(
+                gather_results,
+                [(audio, name) for (audio, name) in zip(all_audio_outs, all_wav_name_outs)]
+            )
+                # group=parallel_state.get_data_parallel_group(),
+            # )
+
+            if local_rank == 0:
+                final_all_gathered_results = {}
+                for result_per_gpu in gather_results:
+                    for audio, name in result_per_gpu:
+                        final_all_gathered_results[name] = audio
+
+                print(f"Writing SHAR files to {self.shar_output_path}")
+                with AudioTarWriter(self.shar_output_path, shard_size=None, format="flac") as audio_writer:
+                    for _cut_id, val in final_all_gathered_results.items():
+                        audio = val
+                        if audio.ndim < 2:
+                            audio = audio.reshape(1, -1)
+                        recording = Recording(
+                            id=_cut_id,
+                            sources=[AudioSource(type="shar", channels=[0], source="")],
+                            sampling_rate=self.cfg.sample_rate,
+                            num_samples=audio.shape[1], # (1, N_samples)
+                            duration=audio.shape[1] / self.cfg.sample_rate,
+                        )
+                        audio_writer.write(key=_cut_id, value=audio, sampling_rate=self.cfg.sample_rate, manifest=recording)
+
 
 class T5TTS_ModelDPO(T5TTS_Model):
     def __init__(self, cfg: DictConfig, trainer: 'Trainer' = None):

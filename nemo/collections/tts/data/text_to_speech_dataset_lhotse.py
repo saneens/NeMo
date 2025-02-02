@@ -20,7 +20,6 @@ import librosa
 import torch
 import random
 from lhotse.dataset.collation import collate_vectors as collate_vectors_lhotse
-from megatron.core import parallel_state
 from omegaconf.omegaconf import OmegaConf
 
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
@@ -59,8 +58,8 @@ def build_lhotse_dataloader(dataset, data_cfg, is_eval=False):
     """Buld dataloader given an input dataset."""
     return get_lhotse_dataloader_from_config(
         data_cfg,
-        global_rank=parallel_state.get_data_parallel_rank(),
-        world_size=parallel_state.get_data_parallel_world_size(),
+        global_rank=torch.distributed.get_rank(),
+        world_size=torch.cuda.device_count(),
         dataset=dataset,
     )
 

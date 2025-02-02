@@ -540,6 +540,10 @@ class T5TTSDataset(TextToSpeechDataset):
             align_prior = torch.tensor(align_prior, dtype=torch.float32)
             example["align_prior"] = align_prior
 
+        # Used during inference to pass the path to store the generated audio
+        if 'target_wav_name' in data.manifest_entry:
+            example['target_wav_name'] = data.manifest_entry['target_wav_name']
+
         example['raw_text'] = data.text
         
         if "reward" in data.manifest_entry:
@@ -568,6 +572,7 @@ class T5TTSDataset(TextToSpeechDataset):
         context_has_text_context_list = []
         reward_list = []
         raw_text_list = []
+        target_wav_name_list = []
         for example in batch:
             dataset_name_list.append(example["dataset_name"])
             audio_filepath_list.append(example["audio_filepath"])
@@ -606,6 +611,9 @@ class T5TTSDataset(TextToSpeechDataset):
 
             if self.include_align_prior:
                 prior_list.append(example["align_prior"])
+
+            if "target_wav_name" in example:
+                target_wav_name_list.append(example["target_wav_name"])
             
         batch_token_len = torch.IntTensor(token_len_list)
         token_max_len = int(batch_token_len.max().item())
@@ -669,6 +677,9 @@ class T5TTSDataset(TextToSpeechDataset):
         
         if len(reward_list) > 0:
             batch_dict['rewards'] = torch.FloatTensor(reward_list)
+
+        if len(target_wav_name_list) > 0:
+            batch_dict['target_wav_names'] = target_wav_name_list
         
         # Assert only ONE of context_audio or context_audio_codes in the batch
         assert ('audio' in batch_dict) ^ ('audio_codes' in batch_dict)
