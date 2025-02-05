@@ -996,6 +996,7 @@ class T5TTS_ModelInference(T5TTS_Model):
         self.predict_step_outputs = []
         self.shar_output_path = cfg.get('shar_output_path', None)
         self.save_in_lhotse_shars = cfg.get('save_in_lhotse_shars', False)
+        self.audio_buffer = {}
         print(f"save_in_lhotse_shars: {self.save_in_lhotse_shars}")
         print(f"shar_output_path: {self.shar_output_path}")
         if not self.save_in_lhotse_shars:
@@ -1073,6 +1074,13 @@ class T5TTS_ModelInference(T5TTS_Model):
                 print(f"... keys in batch: {list(batch.keys())}")
                 if 'target_wav_names' in batch:
                     target_wav_names = batch['target_wav_names']
+                if 'segment_id' in batch and 'total_segments' in batch:
+                    segment_id_list = batch['segment_id']
+                    total_segments_list = batch['total_segments']                    
+                else:
+                    segment_id_list = [0] * len(target_wav_names)
+                    total_segments_list = [1] * len(target_wav_names)
+        
                 predicted_audio_list = []
                 target_wav_list = []
                 for idx in range(predicted_audio.size(0)):
@@ -1083,7 +1091,9 @@ class T5TTS_ModelInference(T5TTS_Model):
                     target_wav_list.append(target_wav_name)
                 results = {
                     'predicted_audio': predicted_audio_list,
-                    'target_wav_names': target_wav_list
+                    'target_wav_names': target_wav_list,
+                    'total_segments_list': total_segments_list,
+                    'segment_id_list': segment_id_list
                 }
                 self.predict_step_outputs.append(results)
             else:
@@ -1148,22 +1158,45 @@ class T5TTS_ModelInference(T5TTS_Model):
             local_rank = torch.distributed.get_rank()
         print(f"world_size: {world_size}, local_rank: {local_rank}")
         if self.save_in_lhotse_shars:
-            gather_results = [None for _ in range(world_size)]
             all_audio_outs = list(itertools.chain(*[item['predicted_audio'] for item in outputs]))
             all_wav_name_outs = list(itertools.chain(*[item['target_wav_names'] for item in outputs]))
+            all_total_segment_outs = list(itertools.chain(*[item['total_segments_list'] for item in outputs]))
+            all_segment_id_outs = list(itertools.chain(*[item['segment_id_list'] for item in outputs]))
 
-            torch.distributed.all_gather_object(
-                gather_results,
-                [(audio, name) for (audio, name) in zip(all_audio_outs, all_wav_name_outs)]
-            )
-                # group=parallel_state.get_data_parallel_group(),
-            # )
+            for wav_name, total_segments, segment_id, predicted_audio in zip(
+                all_wav_name_outs, all_total_segment_outs, all_segment_id_outs, all_audio_outs
+            ):
+                # Initialize the list if not present
+                if wav_name not in self.audio_buffer:
+                    self.audio_buffer[wav_name] = [None] * total_segments
+                # Place the predicted audio at the correct index
+                self.audio_buffer[wav_name][segment_id] = predicted_audio
 
+            # Synchronize buffers across all GPUs
+            gathered_buffers = [None] * world_size
+            torch.distributed.all_gather_object(gathered_buffers, self.audio_buffer)
+
+            # Consolidate buffers only on rank 0
+            completed_keys = []  # Track keys completed in this step
             if local_rank == 0:
+                combined_audio_buffer = {}
+                for gpu_buffer in gathered_buffers:
+                    for k, v in gpu_buffer.items():
+                        if k not in combined_audio_buffer:
+                            combined_audio_buffer[k] = v
+                        else:
+                            for j, seg in enumerate(v):
+                                if seg is not None:
+                                    combined_audio_buffer[k][j] = seg
+
+                # Process completed groups
                 final_all_gathered_results = {}
-                for result_per_gpu in gather_results:
-                    for audio, name in result_per_gpu:
-                        final_all_gathered_results[name] = audio
+                for k, segments in combined_audio_buffer.items():
+                    if all(seg is not None for seg in segments):
+                        concatenated_audio = np.concatenate(segments, axis=0)
+                        final_all_gathered_results[k] = concatenated_audio                   
+                        completed_keys.append(k)  # Mark key as completed
+            
 
                 print(f"Writing SHAR files to {self.shar_output_path}")
                 with AudioTarWriter(self.shar_output_path, shard_size=None, format="flac") as audio_writer:
@@ -1179,6 +1212,15 @@ class T5TTS_ModelInference(T5TTS_Model):
                             duration=audio.shape[1] / self.cfg.sample_rate,
                         )
                         audio_writer.write(key=_cut_id, value=audio, sampling_rate=self.cfg.sample_rate, manifest=recording)
+
+            # Synchronize completed_keys across all ranks
+            obj_list = [completed_keys] if local_rank == 0 else [None]
+            torch.distributed.broadcast_object_list(obj_list, src=0)  # Broadcast completed_keys to all ranks
+            completed_keys = obj_list[0]  # Now all ranks have the same completed_keys list
+            # Remove completed keys from the local audio buffer
+            for k in completed_keys:
+                if k in self.audio_buffer:  # Only delete if key exists
+                    del self.audio_buffer[k]
 
 
 class T5TTS_ModelDPO(T5TTS_Model):
