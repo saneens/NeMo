@@ -830,7 +830,7 @@ class IPATokenizer(BaseTokenizer):
 
         # Remove trailing spaces
         if ps:
-            while ps[-1] == space:
+            while ps and ps[-1] == space:
                 ps.pop()
 
         if self.pad_with_space:
